@@ -5,7 +5,7 @@
 
 #include "MCWMQTT.h"
 #include "Utils.h"
-#include <memory>
+#include "MQTTPersistence.h"
 
 /*
 ** Global variables
@@ -90,6 +90,11 @@ ECOparam paramsSetAutomaticReconnect[] =
     {7014, fftBoolean, 0, 0}
 };
 
+ECOparam paramsSetPersistenceDirectory[] =
+{
+    {7015, fftCharacter, 0, 0}
+};
+
 ECOmethodEvent oMQTTFunctions[] =
 {
     {cSetAddressFunction,               6000, fftBoolean,   sizeof(paramsSetAddress) / sizeof(ECOparam),                  paramsSetAddress,               0, 0},
@@ -110,7 +115,8 @@ ECOmethodEvent oMQTTFunctions[] =
     {cSetMessageExpiryIntervalFunction, 6015, fftBoolean,   sizeof(paramsSetMessageExpiryInterval) / sizeof(ECOparam),    paramsSetMessageExpiryInterval, 0, 0},
     {cSetAutomaticReconnectFunction,    6016, fftBoolean,   sizeof(paramsSetAutomaticReconnect) / sizeof(ECOparam),       paramsSetAutomaticReconnect,    0, 0},
     {cGetErrorMessageFunction,          6017, fftCharacter, 0, 0, 0, 0},
-    {cGetIsConnectedFunction,           6018, fftBoolean,   0, 0, 0, 0}
+    {cGetIsConnectedFunction,           6018, fftBoolean,   0, 0, 0, 0},
+    {cSetPersistenceDirectoryFunction,  6019, fftBoolean,   sizeof(paramsSetPersistenceDirectory) / sizeof(ECOparam),    paramsSetPersistenceDirectory,  0, 0}
 };
 
 #define cFunctionsCount (sizeof(oMQTTFunctions) / sizeof(ECOmethodEvent))
@@ -216,9 +222,8 @@ extern "C" LRESULT OMNISWNDPROC MCWMQTTWndProc(HWND hwnd, UINT Msg, WPARAM wPara
 */
 CMQTT::CMQTT(qobjinst pObjPtr) :
    mObjPtr(pObjPtr),
-   timeout(10),
+   operationTimeout(10),
    qos(1),
-   connected(false),
    client(nullptr),
    retained(false),
    connectTimeout(30),
@@ -226,14 +231,16 @@ CMQTT::CMQTT(qobjinst pObjPtr) :
    keepAliveInterval(60),
    sessionExpiryInterval(-1),
    messageExpiryInterval(-1),
-   automaticReconnect(false)
+   automaticReconnect(false),
+   persistenceDirectory("")
 {
 }
 
 /*
 ** Copy constructor
 */
-CMQTT::CMQTT(qobjinst pObjPtr, const CMQTT *sourceObject)
+CMQTT::CMQTT(qobjinst pObjPtr, const CMQTT *sourceObject) :
+   client(nullptr)
 {
    setObject(pObjPtr, sourceObject);
 }
@@ -243,9 +250,16 @@ CMQTT::CMQTT(qobjinst pObjPtr, const CMQTT *sourceObject)
 */
 void CMQTT::setObject(qobjinst pObjPtr, const CMQTT *sourceObject)
 {
-   mObjPtr = sourceObject->mObjPtr;
+   // Release any client this object already owns before taking over the
+   // source's settings; otherwise it would stay connected (and keep
+   // reconnecting, if enabled) with nothing left to own or delete it.
+   if (client != nullptr) {
+      disconnect(nullptr);
+   }
+
+   mObjPtr = pObjPtr;
    address = sourceObject->address;
-   timeout = sourceObject->timeout;
+   operationTimeout = sourceObject->operationTimeout;
    clientID = sourceObject->clientID;
    topic = sourceObject->topic;
    qos = sourceObject->qos;
@@ -258,11 +272,20 @@ void CMQTT::setObject(qobjinst pObjPtr, const CMQTT *sourceObject)
    sessionExpiryInterval = sourceObject->sessionExpiryInterval;
    messageExpiryInterval = sourceObject->messageExpiryInterval;
    automaticReconnect = sourceObject->automaticReconnect;
+   persistenceDirectory = sourceObject->persistenceDirectory;
 
    errorMessage = "";
-   connected = false;
-   client = nullptr;
 };
+
+/*
+** Single source of truth for whether we currently have a live connection -
+** always asks the underlying paho client rather than trusting a
+** separately-tracked flag that could go stale.
+*/
+bool CMQTT::isActuallyConnected() const
+{
+   return client != nullptr && client->is_connected();
+}
 
 /*
 ** Destructor
@@ -331,6 +354,9 @@ qbool CMQTT::methodCall(EXTCompInfo *pEci)
    case cSetAutomaticReconnectFunction:
       rtnCode = setAutomaticReconnect(pEci);
       break;
+   case cSetPersistenceDirectoryFunction:
+      rtnCode = setPersistenceDirectory(pEci);
+      break;
    case cConnectFunction:
       rtnCode = connect(pEci);
       break;
@@ -361,18 +387,12 @@ void CMQTT::getErrorMessage(EXTCompInfo *pEci) const
 }
 
 /*
-** Returns if te client is connected or not
+** Returns if the client is connected or not
 */
 void CMQTT::getIsConnected(EXTCompInfo *pEci)
 {
-   bool isConnected = false;
-
-   if (client != nullptr) {
-      isConnected = client->is_connected();
-   }
-
    EXTfldval result;
-   boolToEXTfldval(isConnected, result);
+   boolToEXTfldval(isActuallyConnected(), result);
    ECOaddParam(pEci, &result);
 }
 
@@ -389,12 +409,13 @@ qbool CMQTT::setAddress(EXTCompInfo *pEci)
 }
 
 /*
-** Set the timeout value
+** Set the operation timeout (used for disconnect and publish acknowledgement waits;
+** see setConnectTimeout for the timeout used when establishing the connection)
 */
 qbool CMQTT::setTimeout(EXTCompInfo *pEci)
 {
 
-   if (!getIntFromEXTCompInfo(pEci, 1, timeout)) {
+   if (!getIntFromEXTCompInfo(pEci, 1, operationTimeout)) {
       errorMessage = "Incorrect number of parameters.";
       return qfalse;
    }
@@ -498,12 +519,27 @@ qbool CMQTT::setRetained(EXTCompInfo *pEci)
 }
 
 /*
-** Set the connection timeout value
+** Set the connection timeout value (used only when establishing the connection;
+** see setTimeout for the timeout used by disconnect/publish acknowledgement waits)
 */
 qbool CMQTT::setConnectTimeout(EXTCompInfo *pEci)
 {
 
    if (!getIntFromEXTCompInfo(pEci, 1, connectTimeout)) {
+      errorMessage = "Incorrect number of parameters.";
+      return qfalse;
+   }
+   return qtrue;
+}
+
+/*
+** Set a custom directory for on-disk persistence of in-flight QoS1/QoS2
+** messages. If left unset (empty string), a directory under the OS temp
+** folder - scoped by client ID - is used automatically (see connect()).
+*/
+qbool CMQTT::setPersistenceDirectory(EXTCompInfo *pEci)
+{
+   if (!getStringFromEXTCompInfo(pEci, 1, persistenceDirectory)) {
       errorMessage = "Incorrect number of parameters.";
       return qfalse;
    }
@@ -553,80 +589,136 @@ qbool CMQTT::setAutomaticReconnect(EXTCompInfo *pEci)
 */
 qbool CMQTT::connect(EXTCompInfo *pEci)
 {
-   if (connected)
+   if (isActuallyConnected())
       return qtrue;
 
    if (client != nullptr) {
+      // Tear down the stale client; its outcome is irrelevant to this connect.
       disconnect(nullptr);
+      errorMessage = "";
    }
-
-   client = new mqtt::async_client(address, clientID);
-
-   mqtt::properties connectProps;
-   if (sessionExpiryInterval != -1) {
-      connectProps.add(mqtt::property(mqtt::property::SESSION_EXPIRY_INTERVAL, sessionExpiryInterval));
-   }
-
-   mqtt::connect_options connOpts;
-   connOpts.set_mqtt_version(MQTTVERSION_5);
-   connOpts.set_clean_start(cleanStart);
-   connOpts.set_user_name(username);
-   connOpts.set_password(password);
-   connOpts.set_keep_alive_interval(keepAliveInterval);
-   connOpts.set_connect_timeout(connectTimeout);
-   connOpts.set_automatic_reconnect(automaticReconnect);
-   connOpts.set_properties(connectProps);
 
    try {
+      std::string persistDir = persistenceDirectory.empty()
+         ? buildDefaultPersistenceDirectory(clientID)
+         : persistenceDirectory;
+
+      std::string pahoPersistDir;
+      if (!preparePersistenceDirectory(persistDir, pahoPersistDir, errorMessage)) {
+         return qfalse;
+      }
+
+      client = new mqtt::async_client(address, clientID, pahoPersistDir);
+
+      mqtt::properties connectProps;
+      if (sessionExpiryInterval != -1) {
+         connectProps.add(mqtt::property(mqtt::property::SESSION_EXPIRY_INTERVAL, sessionExpiryInterval));
+      }
+
+      mqtt::connect_options connOpts;
+      connOpts.set_mqtt_version(MQTTVERSION_5);
+      connOpts.set_clean_start(cleanStart);
+      connOpts.set_user_name(username);
+      connOpts.set_password(password);
+      connOpts.set_keep_alive_interval(keepAliveInterval);
+      connOpts.set_connect_timeout(connectTimeout);
+      connOpts.set_automatic_reconnect(automaticReconnect);
+      connOpts.set_properties(connectProps);
+
       mqtt::token_ptr token = client->connect(connOpts);
       if (!token->wait_for(std::chrono::seconds(connectTimeout))) {
-         throw new mqtt::exception(mqtt::UNSPECIFIED_ERROR, std::string("Connection not established after ") + std::to_string(connectTimeout) + " seconds");
+         throw mqtt::exception(mqtt::UNSPECIFIED_ERROR, std::string("Connection not established after ") + std::to_string(connectTimeout) + " seconds");
       }
       else if (token->get_return_code() != mqtt::SUCCESS) {
-         throw new mqtt::exception(token->get_return_code(), token->get_error_message());
+         throw mqtt::exception(token->get_return_code(), token->get_error_message());
       }
    }
    catch (const mqtt::exception &ex) {
       errorMessage = ex.what();
+      if (client != nullptr) {
+         delete client;
+         client = nullptr;
+      }
+      return qfalse;
+   }
+   catch (const std::exception &ex) {
+      errorMessage = ex.what();
+      if (client != nullptr) {
+         delete client;
+         client = nullptr;
+      }
+      return qfalse;
+   }
+   catch (...) {
+      errorMessage = "Unknown error while connecting.";
+      if (client != nullptr) {
+         delete client;
+         client = nullptr;
+      }
       return qfalse;
    }
 
-   connected = true;
    return qtrue;
 }
 
 /*
-** Disconnects from the server
+** Disconnects from the server.
+**
+** Runs whenever a client instance exists rather than trusting a
+** separately-tracked connected flag (see isActuallyConnected()), because
+** such a flag would not be updated if the connection drops in the
+** background (e.g. while automaticReconnect is in progress). The underlying
+** client is always torn down here - even if the graceful disconnect fails
+** or throws - so that any pending automatic-reconnect attempt is stopped
+** before the client object is released. This matters most when called from
+** the destructor, where leaving a reconnect attempt running against a
+** client whose owning CMQTT is being destroyed would be unsafe.
 */
 qbool CMQTT::disconnect(EXTCompInfo *pEci)
 {
-   if (connected) {
-      if (client != nullptr) {
-         try {
-            mqtt::disconnect_options disc;
-            disc.set_reason_code(mqtt::NORMAL_DISCONNECTION);
-            disc.set_timeout(std::chrono::seconds(timeout));
-            mqtt::token_ptr token = client->disconnect(disc);
-            if (!token->wait_for(std::chrono::seconds(timeout))) {
-               throw new mqtt::exception(mqtt::UNSPECIFIED_ERROR, std::string("Connection not disconnected after ") + std::to_string(timeout) + " seconds");
-            }
-            else if (token->get_return_code() != mqtt::SUCCESS) {
-               throw new mqtt::exception(token->get_return_code(), token->get_error_message());
-            }
-         }
-         catch (const mqtt::exception &ex) {
-            errorMessage = ex.what();
-            return qfalse;
-         }
-
-         delete client;
-         client = nullptr;
-      }
-
-      connected = false;
+   if (client == nullptr) {
+      return qtrue;
    }
 
-   return qtrue;
+   qbool result = qtrue;
+
+   try {
+      mqtt::disconnect_options disc;
+      disc.set_reason_code(mqtt::NORMAL_DISCONNECTION);
+      disc.set_timeout(std::chrono::seconds(operationTimeout));
+      mqtt::token_ptr token = client->disconnect(disc);
+      if (!token->wait_for(std::chrono::seconds(operationTimeout))) {
+         throw mqtt::exception(mqtt::UNSPECIFIED_ERROR, std::string("Connection not disconnected after ") + std::to_string(operationTimeout) + " seconds");
+      }
+      else if (token->get_return_code() != mqtt::SUCCESS) {
+         throw mqtt::exception(token->get_return_code(), token->get_error_message());
+      }
+   }
+   catch (const mqtt::exception &ex) {
+      // Already disconnected (e.g. the connection dropped in the background):
+      // the desired end state has been reached, so this is not an error.
+      if (ex.get_return_code() != MQTTASYNC_DISCONNECTED) {
+         errorMessage = ex.what();
+         result = qfalse;
+      }
+   }
+   catch (const std::exception &ex) {
+      errorMessage = ex.what();
+      result = qfalse;
+   }
+   catch (...) {
+      errorMessage = "Unknown error while disconnecting.";
+      result = qfalse;
+   }
+
+   // Always tear down the client, even after a failed/thrown disconnect above,
+   // so automatic reconnect (if enabled) cannot keep running against a client
+   // this object is about to give up ownership of.
+   delete client;
+   client = nullptr;
+
+   return result;
+
 }
 
 /*
@@ -634,7 +726,7 @@ qbool CMQTT::disconnect(EXTCompInfo *pEci)
 */
 qbool CMQTT::publish(EXTCompInfo *pEci)
 {
-   if (!connected) {
+   if (!isActuallyConnected()) {
       errorMessage = "Connection not open";
       return qfalse;
    }
@@ -646,23 +738,36 @@ qbool CMQTT::publish(EXTCompInfo *pEci)
    }
 
    try {
-      mqtt::properties props;
-      if (messageExpiryInterval != -1) {
-         props.add(mqtt::property(mqtt::property::MESSAGE_EXPIRY_INTERVAL, messageExpiryInterval));
-      }
-
       mqtt::message_ptr mqttMessage = mqtt::make_message(topic, message, qos, retained);
 
+      if (messageExpiryInterval != -1) {
+         mqtt::properties props;
+         props.add(mqtt::property(mqtt::property::MESSAGE_EXPIRY_INTERVAL, messageExpiryInterval));
+         mqttMessage->set_properties(props);
+      }
+
       mqtt::const_delivery_token_ptr token = client->publish(mqttMessage);
-      if (!token->wait_for(std::chrono::seconds(timeout))) {
-         throw new mqtt::exception(mqtt::UNSPECIFIED_ERROR, std::string("Message not deflivered after ") + std::to_string(timeout) + " seconds");
+      if (!token->wait_for(std::chrono::seconds(operationTimeout))) {
+         // The message may still be delivered later from persistence (QoS1/QoS2),
+         // but that is not guaranteed, so the caller must treat it as not sent.
+         throw mqtt::exception(mqtt::UNSPECIFIED_ERROR,
+                               std::string("Delivery not confirmed after ") + std::to_string(operationTimeout) +
+                               " seconds. The message may or may not have reached the broker; publish it again to avoid losing it (a duplicate may result).");
       }
       else if (token->get_return_code() != mqtt::SUCCESS) {
-         throw new mqtt::exception(token->get_return_code(), token->get_error_message());
+         throw mqtt::exception(token->get_return_code(), token->get_error_message());
       }
    }
    catch (const mqtt::exception &ex) {
       errorMessage = ex.what();
+      return qfalse;
+   }
+   catch (const std::exception &ex) {
+      errorMessage = ex.what();
+      return qfalse;
+   }
+   catch (...) {
+      errorMessage = "Unknown error while publishing.";
       return qfalse;
    }
 

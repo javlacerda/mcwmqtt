@@ -10,7 +10,7 @@ const qlong RES_CONST_START = 20000;
 const qlong RES_CONST_END = 20002;
 
 const qshort VERSION_MAJOR = 1;
-const qshort VERSION_MINOR = 0;
+const qshort VERSION_MINOR = 1;
 
 const qshort cObject_MQTT = 1;
 
@@ -33,6 +33,7 @@ const qlong cSetMessageExpiryIntervalFunction = 16;
 const qlong cSetAutomaticReconnectFunction = 17;
 const qlong cGetErrorMessageFunction = 18;
 const qlong cGetIsConnectedFunction = 19;
+const qlong cSetPersistenceDirectoryFunction = 20;
 
 const qlong kMQTTQoS0 = 0;
 const qlong kMQTTQoS1 = 1;
@@ -43,8 +44,8 @@ class CMQTT
 private:
     std::string errorMessage;
     std::string address;
-    int timeout;
-    int connectTimeout;
+    int operationTimeout;   // used for disconnect() and publish() acknowledgement waits
+    int connectTimeout;     // used only for establishing the initial connection (connect())
     std::string clientID;
     std::string topic;
     int qos;
@@ -54,11 +55,18 @@ private:
     int sessionExpiryInterval;
     int messageExpiryInterval;
     bool cleanStart;
-    bool connected;
     bool retained;
     bool automaticReconnect;
+    std::string persistenceDirectory;   // empty = use the default (system temp) directory
 
     mqtt::async_client *client;
+
+    // Single source of truth for connection state - queries the underlying
+    // paho client directly instead of relying on a separately-tracked flag,
+    // which could go stale if the connection drops or recovers in the
+    // background (e.g. via automaticReconnect) without connect()/disconnect()
+    // being called again.
+    bool isActuallyConnected() const;
 
 public:
     qobjinst mObjPtr;
@@ -84,6 +92,7 @@ public:
     qbool setSessionExpiryInterval(EXTCompInfo *pEci);
     qbool setMessageExpiryInterval(EXTCompInfo *pEci);
     qbool setAutomaticReconnect(EXTCompInfo *pEci);
+    qbool setPersistenceDirectory(EXTCompInfo *pEci);
     void getIsConnected(EXTCompInfo *pEci);
     void getErrorMessage(EXTCompInfo *pEci) const;
 
